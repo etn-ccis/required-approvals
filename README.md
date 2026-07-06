@@ -36,6 +36,8 @@ Checks if the required codeowners have approved a PR and requires a minimum numb
 ### Outputs:
 - `approved`
   - `true` if all required approvals are met, `false` otherwise
+- `reason`
+  - A human-readable explanation of why the approval requirements were or were not met (e.g. `All codeowners have approved. and total approvals:2 >= minimum approvals:2`). Useful for surfacing the result back to consumers, such as commenting on the PR.
 
 ### How to use this GitHub Action:
 1. Ensure your repo has a codeowners file at `/.github/CODEOWNERS` or `/CODEOWNERS`
@@ -78,4 +80,9 @@ Checks if the required codeowners have approved a PR and requires a minimum numb
             if: ${{ steps.check-approvals.outputs.approved == 'true' }}
             run: |
               echo "All required approvals are met. Running the action."
+
+          - name: Report the reason if approvals are not met
+            if: ${{ steps.check-approvals.outputs.approved != 'true' }}
+            run: |
+              echo "Approvals not met: ${{ steps.check-approvals.outputs.reason }}"
     ```

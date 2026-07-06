@@ -1,8 +1,14 @@
-const { Octokit } = require("@octokit/rest");
 const minimatch = require("minimatch").minimatch;
 const process = require("process");
 const path = require("path");
 const fs = require("fs");
+
+// @octokit/rest v20+ is ESM-only, so it must be loaded via dynamic import
+// from this CommonJS module. ncc bundles the resolved module correctly.
+async function loadOctokit() {
+    const { Octokit } = await import("@octokit/rest");
+    return Octokit;
+}
 
 async function getNewestPRNumberByBranch(octokit, branchName, repo) {
     const pullRequests = await octokit.paginate(
@@ -26,19 +32,32 @@ async function getNewestPRNumberByBranch(octokit, branchName, repo) {
     return newestPR;
 }
 
-async function getRequiredCodeowners(changedFiles, repo, pr, octokit) {
-    const codeownersContent =
-        (await getContent(octokit, repo, ".github/CODEOWNERS", pr.base.ref)) ||
-        (await getContent(octokit, repo, "CODEOWNERS", pr.base.ref));
+// Normalize a raw CODEOWNERS owner token into a lowercase slug/login.
+// Teams (`@org/team`) collapse to `team`; bare users (`@user`) collapse to `user`.
+function normalizeOwner(owner) {
+    owner = owner.replace(/[<>\(\)\[\]\{\},;+*?=]/g, "");
+    owner = owner.replace("@", "").split("/").pop();
+    return owner.toLowerCase();
+}
 
-    if (!codeownersContent) {
-        console.info("No CODEOWNERS file found");
-        process.exit(1);
+// Parse CODEOWNERS content and, for the given changed files, build a map of
+// required owner slugs -> approval state (initialized to false).
+function parseCodeowners(codeownersContent, changedFiles) {
+    const codeownersLines = codeownersContent.split("\n");
+    const codeowners = {};
+
+    function updateCodeowners(owners) {
+        for (const rawOwner of owners) {
+            const owner = normalizeOwner(rawOwner);
+            if (!owner) {
+                continue;
+            }
+            if (!Object.prototype.hasOwnProperty.call(codeowners, owner)) {
+                codeowners[owner] = false;
+            }
+        }
     }
 
-    const codeownersLines = codeownersContent.split("\n");
-
-    const codeowners = {};
     for (const line of codeownersLines) {
         if (!line.trim() || line.startsWith("#")) {
             continue;
@@ -46,13 +65,13 @@ async function getRequiredCodeowners(changedFiles, repo, pr, octokit) {
 
         let [pattern, ...owners] = line.trim().split(/\s+/);
 
-        if (pattern === '*') {
+        if (pattern === "*") {
             updateCodeowners(owners);
         } else {
-            if (!pattern.startsWith('/') && !pattern.startsWith('*')) {
+            if (!pattern.startsWith("/") && !pattern.startsWith("*")) {
                 pattern = `{**/,}${pattern}`;
             }
-            if (!path.extname(pattern) && !pattern.endsWith('*')) {
+            if (!path.extname(pattern) && !pattern.endsWith("*")) {
                 pattern = `${pattern}{/**,}`;
             }
             for (let changedFile of changedFiles) {
@@ -66,17 +85,19 @@ async function getRequiredCodeowners(changedFiles, repo, pr, octokit) {
     }
 
     return codeowners;
+}
 
-    function updateCodeowners(owners) {
-        for (let owner of owners) {
-            owner = owner.replace(/[<>\(\)\[\]\{\},;+*?=]/g, "");
-            owner = owner.replace("@", "").split("/").pop();
-            owner = owner.toLowerCase();
-            if (!codeowners.hasOwnProperty(owner)) {
-                codeowners[owner] = false;
-            }
-        }
+async function getRequiredCodeowners(changedFiles, repo, pr, octokit) {
+    const codeownersContent =
+        (await getContent(octokit, repo, ".github/CODEOWNERS", pr.base.ref)) ||
+        (await getContent(octokit, repo, "CODEOWNERS", pr.base.ref));
+
+    if (!codeownersContent) {
+        console.info("No CODEOWNERS file found");
+        process.exit(1);
     }
+
+    return parseCodeowners(codeownersContent, changedFiles);
 }
 
 async function getUserTeams(username, orgName, orgTeams, octokit) {
@@ -122,6 +143,109 @@ async function getContent(octokit, repo, path, ref) {
     }
 }
 
+// Evaluate PR reviews against required codeowners.
+// Mutates a copy of requiredCodeownerEntities and returns the approval outcome.
+// reviewsWithTeams: array of { review, userTeams } where review has
+//   { state, commit_id, user: { login } } and userTeams is an array of { slug }.
+function evaluateReviews(requiredCodeownerEntities, reviewsWithTeams, options) {
+    const { requireAllApprovalsLatestCommit, headSha } = options;
+    const entities = { ...requiredCodeownerEntities };
+    const approvedCodeowners = [];
+
+    const isLatestCommit = (review) =>
+        requireAllApprovalsLatestCommit !== "true" || review.commit_id === headSha;
+
+    const addApprover = (login) => {
+        if (!approvedCodeowners.includes(login)) {
+            approvedCodeowners.push(login);
+        }
+    };
+
+    for (const { review, userTeams } of reviewsWithTeams) {
+        const reviewerLogin = review.user.login.toLowerCase();
+
+        if (review.state === "APPROVED") {
+            for (const team of userTeams) {
+                if (Object.prototype.hasOwnProperty.call(entities, team.slug)) {
+                    if (!isLatestCommit(review)) {
+                        console.info(
+                            `  ${reviewerLogin} ${review.state}: at commit: ${review.commit_id} for: ${team.slug} (not the latest commit, ignoring)`
+                        );
+                        continue;
+                    }
+                    entities[team.slug] = true;
+                    addApprover(review.user.login);
+                    console.info(
+                        `  ${reviewerLogin} ${review.state}: at commit: ${review.commit_id} for: ${team.slug}`
+                    );
+                }
+            }
+
+            if (Object.prototype.hasOwnProperty.call(entities, reviewerLogin)) {
+                if (!isLatestCommit(review)) {
+                    console.info(
+                        `  ${reviewerLogin} ${review.state}: at commit: ${review.commit_id} (not the latest commit, ignoring)`
+                    );
+                } else {
+                    entities[reviewerLogin] = true;
+                    addApprover(review.user.login);
+                    console.info(
+                        `  ${reviewerLogin} ${review.state}: at commit: ${review.commit_id}`
+                    );
+                }
+            }
+        } else if (review.state === "CHANGES_REQUESTED") {
+            for (const team of userTeams) {
+                if (Object.prototype.hasOwnProperty.call(entities, team.slug)) {
+                    entities[team.slug] = false;
+                    console.info(`  ${reviewerLogin} ${review.state}: for: ${team.slug}`);
+                }
+            }
+            if (Object.prototype.hasOwnProperty.call(entities, reviewerLogin)) {
+                entities[reviewerLogin] = false;
+                console.info(`  ${reviewerLogin} ${review.state}: for: ${reviewerLogin}`);
+            }
+        } else {
+            console.debug(`  ${reviewerLogin} ${review.state}: ignoring`);
+        }
+    }
+
+    return { entities, approvedCodeowners };
+}
+
+// Compute the final approval decision and human-readable reason.
+function computeApprovalResult(entities, approvedCodeowners, options) {
+    const { approvalMode, minApprovals } = options;
+
+    const allCodeownersApproved = Object.values(entities).every((value) => value);
+    const anyCodeownerApproved = Object.values(entities).some((value) => value);
+
+    const codeownersApprovalsCheck =
+        approvalMode === "ANY" ? anyCodeownerApproved : allCodeownersApproved;
+    const uniqueApprovals = new Set(approvedCodeowners).size;
+    const minApprovalsMet = uniqueApprovals >= minApprovals;
+
+    let coReason;
+    if (approvalMode === "ANY") {
+        coReason = anyCodeownerApproved
+            ? "At least one of the codeowners has approved."
+            : "None of the codeowners has approved.";
+    } else {
+        coReason = allCodeownersApproved
+            ? "All codeowners have approved."
+            : "Not all codeowners have approved.";
+    }
+
+    const maReason = minApprovalsMet
+        ? `total approvals:${uniqueApprovals} >= minimum approvals:${minApprovals}`
+        : `total approvals:${uniqueApprovals} < minimum approvals:${minApprovals}`;
+    const reason = `${coReason} and ${maReason}`;
+
+    const approved = codeownersApprovalsCheck && minApprovalsMet;
+
+    return { approved, reason };
+}
+
 async function main() {
     const token = process.env["INPUT_TOKEN"];
     const readOrgToken = process.env["INPUT_READ_ORG_SCOPED_TOKEN"];
@@ -133,6 +257,7 @@ async function main() {
     const ghRepo = process.env["GITHUB_REPOSITORY"];
     const approvalMode = process.env["INPUT_APPROVAL_MODE"];
 
+    const Octokit = await loadOctokit();
     const octokit = new Octokit({ auth: token });
     const readOrgOctokit = new Octokit({ auth: readOrgToken });
 
@@ -204,87 +329,47 @@ async function main() {
         orgTeams = allOrgTeams;
     }
 
-    let approvedCodeowners = [];
-
+    const reviewsWithTeams = [];
     for (const review of reviews) {
         const userTeams = await getUserTeams(review.user.login, orgName, orgTeams, readOrgOctokit);
-        const reviewerLogin = review.user.login.toLowerCase();
-
-        if (review.state === "APPROVED") {
-            for (const team of userTeams) {
-                if (requiredCodeownerEntities.hasOwnProperty(team.slug)) {
-                    if (
-                        requireAllApprovalsLatestCommit === "true" &&
-                        review.commit_id !== pr.head.sha
-                    ) {
-                        console.info(
-                            `  ${reviewerLogin} ${review.state}: at commit: ${review.commit_id} for: ${team.slug} (not the latest commit, ignoring)`
-                        );
-                        continue;
-                    }
-                    requiredCodeownerEntities[team.slug] = true;
-                    if (!approvedCodeowners.includes(review.user.login)) {
-                        approvedCodeowners.push(review.user.login);
-                    }
-                    console.info(
-                        `  ${reviewerLogin} ${review.state}: at commit: ${review.commit_id} for: ${team.slug}`
-                    );
-                }
-            }
-
-            if (requiredCodeownerEntities.hasOwnProperty(reviewerLogin)) {
-                requiredCodeownerEntities[reviewerLogin] = true;
-                console.info(
-                    `  ${reviewerLogin} ${review.state}: at commit: ${review.commit_id}`
-                );
-            }
-        } else if (review.state === "CHANGES_REQUESTED") {
-            for (const team of userTeams) {
-                if (requiredCodeownerEntities.hasOwnProperty(team.slug)) {
-                    requiredCodeownerEntities[team.slug] = false;
-                    console.info(`  ${reviewerLogin} ${review.state}: for: ${team.slug}`);
-                }
-            }
-            if (requiredCodeownerEntities.hasOwnProperty(reviewerLogin)) {
-                requiredCodeownerEntities[reviewerLogin] = false;
-                console.info(`  ${reviewerLogin} ${review.state}: for: ${reviewerLogin}`);
-            }
-        } else {
-            console.debug(`  ${reviewerLogin} ${review.state}: ignoring`);
-        }
+        reviewsWithTeams.push({ review, userTeams });
     }
 
-    const allCodeownersApproved = Object.values(requiredCodeownerEntities).every((value) => value);
-    const anyCodeownerApproved = Object.values(requiredCodeownerEntities).some((value) => value);
+    const { entities, approvedCodeowners } = evaluateReviews(
+        requiredCodeownerEntities,
+        reviewsWithTeams,
+        { requireAllApprovalsLatestCommit, headSha: pr.head.sha }
+    );
 
-    const codeownersApprovalsCheck = approvalMode === "ANY" ? anyCodeownerApproved : allCodeownersApproved;
-    const minApprovalsMet = new Set(approvedCodeowners).size >= minApprovals;
-
-    let coReason;
-    if (approvalMode === "ALL") {
-        coReason = allCodeownersApproved ? "All codeowners have approved." : "Not all codeowners have approved.";
-    } else if (approvalMode === "ANY") {
-        coReason = anyCodeownerApproved ? "At least one of the codeowners has approved." : "None of the codeowners has approved.";
-    }
-
-    const maReason = minApprovalsMet
-        ? `total approvals:${approvedCodeowners.length} >= minimum approvals:${minApprovals}`
-        : `total approvals:${approvedCodeowners.length} < minimum approvals:${minApprovals}`;
-    const reason = `${coReason} and ${maReason}`;
-
-    const requiredApprovals = codeownersApprovalsCheck && minApprovalsMet;
+    const { approved, reason } = computeApprovalResult(entities, approvedCodeowners, {
+        approvalMode,
+        minApprovals,
+    });
 
     const outputPath = process.env["GITHUB_OUTPUT"];
-    fs.appendFileSync(outputPath, `approved=${requiredApprovals.toString().toLowerCase()}`);
+    fs.appendFileSync(
+        outputPath,
+        `approved=${approved.toString().toLowerCase()}\nreason=${reason}\n`
+    );
 
-    if (requiredApprovals) {
+    if (approved) {
         console.info(`Required approvals met: ${reason}`);
         process.exit(0);
     } else {
         console.warn(`Required approvals not met: ${reason}`);
         process.exit(1);
     }
-
 }
 
-main();
+module.exports = {
+    normalizeOwner,
+    parseCodeowners,
+    evaluateReviews,
+    computeApprovalResult,
+    main,
+};
+
+// Only run automatically when executed directly (not when imported by tests).
+if (require.main === module) {
+    main();
+}

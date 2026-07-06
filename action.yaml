@@ -37,7 +37,9 @@ inputs:
 outputs:
   approved:
     description: "True if all required approvals are met, false otherwise"
+  reason:
+    description: "Human-readable explanation of why the approval requirements were or were not met"
 
 runs:
-  using: "node20"
+  using: "node24"
   main: "dist/index.js"
